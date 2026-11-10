@@ -622,6 +622,26 @@ func TestServer_HandleMetrics_Unavailable(t *testing.T) {
 	}
 }
 
+// With performance monitoring off, /metrics still serves the request
+// metrics installed with SetMetricsWriter.
+func TestServer_HandleMetrics_RequestMetricsOnly(t *testing.T) {
+	SetMetricsWriter(func(w io.Writer) error {
+		_, err := io.WriteString(w, "gen_ai_server_request_duration_seconds_count 1\n")
+		return err
+	})
+	defer SetMetricsWriter(nil)
+	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
+
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "gen_ai_server_request_duration_seconds_count 1") {
+		t.Errorf("body = %q, want the request metrics", w.Body.String())
+	}
+}
+
 func TestServer_Redirects(t *testing.T) {
 	s := newTestServer(newStubRouter(nil, ""), newStubRouter(nil, ""))
 

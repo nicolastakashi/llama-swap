@@ -3,9 +3,11 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
@@ -438,15 +440,39 @@ func (s *Server) startPreload() {
 	}()
 }
 
-// handleMetrics serves Prometheus-format performance metrics. Returns 503 when
-// performance monitoring is disabled.
+// metricsWriter appends extra Prometheus text-format metrics, such as the
+// GenAI request histograms, to /metrics. It outlives config reloads like the
+// request observer.
+var metricsWriter atomic.Pointer[func(io.Writer) error]
+
+// SetMetricsWriter installs fn to append metrics to /metrics; nil removes it.
+func SetMetricsWriter(fn func(io.Writer) error) {
+	if fn == nil {
+		metricsWriter.Store(nil)
+		return
+	}
+	metricsWriter.Store(&fn)
+}
+
+// handleMetrics serves Prometheus-format host metrics and, when installed,
+// the request metrics from SetMetricsWriter. Returns 503 when neither is
+// available.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
-	if s.perf == nil {
+	extra := metricsWriter.Load()
+	if s.perf == nil && extra == nil {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		w.Write([]byte("# performance monitor not available\n"))
 		return
 	}
-	s.perf.MetricsHandler().ServeHTTP(w, r)
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	if s.perf != nil {
+		s.perf.MetricsHandler().ServeHTTP(w, r)
+	}
+	if extra != nil {
+		if err := (*extra)(w); err != nil {
+			s.logs.ProxyLogs.Warnf("writing request metrics: %v", err)
+		}
+	}
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {

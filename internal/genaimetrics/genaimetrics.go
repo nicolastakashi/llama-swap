@@ -1,22 +1,28 @@
 // Package genaimetrics turns finished requests into OpenTelemetry GenAI
-// semantic convention histograms and exports them over OTLP with the
-// OpenTelemetry Go SDK.
+// semantic convention histograms with the OpenTelemetry Go SDK. The same
+// instruments feed every output: a Prometheus reader that llama-swap serves
+// on /metrics, and an OTLP exporter when one is configured.
 //
-// It is opt-in through the standard OTEL_* environment variables: nothing is
-// created unless an OTLP endpoint is set. The SDK reads the rest (headers,
-// timeout, compression, TLS, export interval, resource attributes).
+// OTLP is opt-in through the standard OTEL_* environment variables: it is
+// only created when an OTLP endpoint is set. The SDK reads the rest
+// (headers, timeout, compression, TLS, export interval, resource
+// attributes).
 package genaimetrics
 
 import (
 	"context"
 	"errors"
+	"io"
 	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/expfmt"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	"go.opentelemetry.io/otel/metric"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/resource"
@@ -41,21 +47,17 @@ var (
 // Metrics records GenAI histograms for finished requests.
 type Metrics struct {
 	provider *sdkmetric.MeterProvider
+	registry *prometheus.Registry
 	duration genaiconv.ServerRequestDuration
 	tokens   genaiconv.ClientTokenUsage
 	tpot     genaiconv.ServerTimePerOutputToken
 }
 
-// FromEnv builds Metrics exporting over OTLP. It returns nil, nil when
-// no OTLP endpoint is set or metrics are disabled, so callers pay nothing
-// unless the user opted in.
-func FromEnv(ctx context.Context, getenv func(string) string, version string, logger *logmon.Monitor) (*Metrics, error) {
-	if strings.EqualFold(getenv("OTEL_SDK_DISABLED"), "true") || !otlpSelected(getenv("OTEL_METRICS_EXPORTER")) {
-		return nil, nil
-	}
-	// The exporter would fall back to localhost:4318; require an explicit
-	// endpoint so the feature stays off by default.
-	if getenv("OTEL_EXPORTER_OTLP_ENDPOINT") == "" && getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") == "" {
+// New builds Metrics with a Prometheus reader, plus an OTLP exporter when
+// the OTEL_* environment selects one. It returns nil, nil only when
+// OTEL_SDK_DISABLED is true.
+func New(ctx context.Context, getenv func(string) string, version string, logger *logmon.Monitor) (*Metrics, error) {
+	if strings.EqualFold(getenv("OTEL_SDK_DISABLED"), "true") {
 		return nil, nil
 	}
 	// Later options win, so OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES
@@ -68,28 +70,58 @@ func FromEnv(ctx context.Context, getenv func(string) string, version string, lo
 	)
 	if errors.Is(err, resource.ErrPartialResource) {
 		if logger != nil {
-			logger.Warnf("OTLP resource attributes partly ignored: %v", err)
+			logger.Warnf("OTel resource attributes partly ignored: %v", err)
 		}
 	} else if err != nil {
 		return nil, err
 	}
-	exporter, err := newExporter(ctx, getenv, logger)
+
+	registry := prometheus.NewRegistry()
+	promReader, err := otelprom.New(otelprom.WithRegisterer(registry), otelprom.WithoutScopeInfo())
 	if err != nil {
 		return nil, err
 	}
-	provider := sdkmetric.NewMeterProvider(
-		sdkmetric.WithResource(res),
-		sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter)),
-	)
+	opts := []sdkmetric.Option{sdkmetric.WithResource(res), sdkmetric.WithReader(promReader)}
+
+	// The OTLP exporter would fall back to localhost:4318; require an
+	// explicit endpoint so it stays off by default.
+	otlp := otlpSelected(getenv("OTEL_METRICS_EXPORTER")) &&
+		(getenv("OTEL_EXPORTER_OTLP_ENDPOINT") != "" || getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") != "")
+	if otlp {
+		exporter, err := newExporter(ctx, getenv, logger)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, sdkmetric.WithReader(sdkmetric.NewPeriodicReader(exporter)))
+	}
+
+	provider := sdkmetric.NewMeterProvider(opts...)
 	m, err := newMetrics(provider)
 	if err != nil {
 		_ = provider.Shutdown(ctx)
 		return nil, err
 	}
-	if logger != nil {
+	m.registry = registry
+	if otlp && logger != nil {
 		logger.Info("OTLP GenAI metrics enabled")
 	}
 	return m, nil
+}
+
+// WritePrometheus writes the GenAI metrics in the Prometheus text format,
+// for llama-swap's /metrics endpoint.
+func (m *Metrics) WritePrometheus(w io.Writer) error {
+	families, err := m.registry.Gather()
+	if err != nil {
+		return err
+	}
+	enc := expfmt.NewEncoder(w, expfmt.NewFormat(expfmt.TypeTextPlain))
+	for _, mf := range families {
+		if err := enc.Encode(mf); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // otlpSelected reports whether OTEL_METRICS_EXPORTER, a comma-separated

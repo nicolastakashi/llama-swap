@@ -245,15 +245,17 @@ func main() {
 
 	buildInfo := server.BuildInfo{Version: version, Commit: commit, Date: date}
 
-	// GenAI metrics over OTLP, opt-in through the OTEL_* environment. The
-	// exporter outlives config reloads so its cumulative totals do too.
+	// GenAI request metrics, served on /metrics and pushed over OTLP when the
+	// OTEL_* environment asks for it. They outlive config reloads so their
+	// cumulative totals do too.
 	otel.SetErrorHandler(otel.ErrorHandlerFunc(func(err error) { proxyLog.Warnf("otel: %v", err) }))
-	genaiMetrics, err := genaimetrics.FromEnv(context.Background(), os.Getenv, version, proxyLog)
+	genaiMetrics, err := genaimetrics.New(context.Background(), os.Getenv, version, proxyLog)
 	if err != nil {
-		proxyLog.Warnf("OTLP metrics disabled: %v", err)
+		proxyLog.Warnf("GenAI metrics disabled: %v", err)
 	}
 	if genaiMetrics != nil {
 		server.SetRequestObserver(genaiMetrics.Record)
+		server.SetMetricsWriter(genaiMetrics.WritePrometheus)
 	}
 
 	// Indexed once and shared by every Server instance, including the ones a

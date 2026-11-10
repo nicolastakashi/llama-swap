@@ -35,15 +35,17 @@ fallback. `tau` and `cycles` are not draft/accepted token counters, so those
 columns stay unknown too. Hipfire's model listing does not report context
 length or tool/vision capabilities; configure those manually when needed.
 
-## OpenTelemetry (OTLP) metrics
+## Request metrics (Prometheus and OpenTelemetry)
 
-llama-swap can push per-request metrics that follow the OpenTelemetry GenAI
-semantic conventions to an OTLP endpoint, such as an OpenTelemetry
-Collector. They come from the same record as the Activity view, so requests
-served by a model that has since been swapped out are still counted, even
-when the activity store fails to save the row. It is
-off unless an OTLP endpoint is set in the environment; there is no config
-file setting:
+llama-swap records per-request histograms that follow the OpenTelemetry
+GenAI semantic conventions. They come from the same record as the Activity
+view, so requests served by a model that has since been swapped out are
+still counted. The same histograms are available two ways:
+
+- `GET /metrics`, in the Prometheus text format, next to the host metrics.
+  This is always on.
+- Pushed to an OTLP endpoint, such as an OpenTelemetry Collector, when one
+  is set in the environment. There is no config file setting:
 
 ```bash
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 \
@@ -85,6 +87,13 @@ What goes wrong:
 - `gen_ai.provider.name` is `unknown` when llama-swap could not detect the
   server behind a model (it reads `/v1/models`). llama-server shows as
   `llama.cpp`.
+- Prometheus names use underscores and unit suffixes, as the OpenTelemetry
+  to Prometheus conversion does: `gen_ai.server.request.duration` becomes
+  `gen_ai_server_request_duration_seconds` and `gen_ai.request.model` the
+  label `gen_ai_request_model`. A `target_info` series carries the service
+  name and version.
+- `OTEL_SDK_DISABLED=true` turns the request histograms off on `/metrics`
+  too.
 - Time to first token is not reported; llama-swap does not measure it.
 - Realtime (`/v1/realtime`) websocket sessions are not reported: one
   session is not one request. They still show in the Activity view.

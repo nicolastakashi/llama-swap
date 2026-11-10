@@ -1,6 +1,7 @@
 package genaimetrics
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
@@ -19,32 +20,59 @@ func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
 
-func TestGenAIMetrics_FromEnvOptIn(t *testing.T) {
-	for name, env := range map[string]map[string]string{
-		"no endpoint":  {"OTEL_SERVICE_NAME": "x"},
-		"sdk disabled": {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://c:4318", "OTEL_SDK_DISABLED": "true"},
-		"exporter off": {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://c:4318", "OTEL_METRICS_EXPORTER": "none"},
-		"exporter OFF": {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://c:4318", "OTEL_METRICS_EXPORTER": "NONE"},
-		"other only":   {"OTEL_EXPORTER_OTLP_ENDPOINT": "http://c:4318", "OTEL_METRICS_EXPORTER": "prometheus"},
-	} {
-		m, err := FromEnv(context.Background(), envOf(env), "v1", nil)
-		require.NoError(t, err, name)
-		assert.Nil(t, m, name)
-	}
+func TestGenAIMetrics_New(t *testing.T) {
+	m, err := New(context.Background(), envOf(map[string]string{"OTEL_SDK_DISABLED": "true"}), "v1", nil)
+	require.NoError(t, err)
+	assert.Nil(t, m)
 
 	// The SDK reads its settings from the real environment. A malformed
-	// resource attribute (an entry with no value) must not turn the feature off.
+	// resource attribute (an entry with no value) must not turn metrics off,
+	// and OTLP is added only when an endpoint is set.
 	t.Setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:1")
 	t.Setenv("OTEL_RESOURCE_ATTRIBUTES", "deployment.environment.name=homelab,oops")
-	m, err := FromEnv(context.Background(), envOf(map[string]string{
-		"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:1",
-		"OTEL_METRICS_EXPORTER":       "console, OTLP",
-	}), "v1", nil)
+	for name, env := range map[string]map[string]string{
+		"prometheus only": {},
+		"with otlp": {
+			"OTEL_EXPORTER_OTLP_ENDPOINT": "http://127.0.0.1:1",
+			"OTEL_METRICS_EXPORTER":       "console, OTLP",
+		},
+	} {
+		m, err := New(context.Background(), envOf(env), "v1", nil)
+		require.NoError(t, err, name)
+		require.NotNil(t, m, name)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // don't wait on the unreachable endpoint
+		_ = m.Shutdown(ctx)
+	}
+}
+
+// TestGenAIMetrics_Prometheus checks the text llama-swap appends to
+// /metrics: Prometheus names translated from the semconv ones, labels and
+// the advised buckets.
+func TestGenAIMetrics_Prometheus(t *testing.T) {
+	m, err := New(context.Background(), envOf(nil), "v1", nil)
 	require.NoError(t, err)
-	require.NotNil(t, m)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // don't wait on the unreachable endpoint
-	_ = m.Shutdown(ctx)
+	defer m.Shutdown(context.Background())
+
+	m.Record(store.ActivityLogEntry{
+		Model: "qwen", Task: "chat", ReqPath: "/v1/chat/completions", RespStatusCode: 200, DurationMs: 1500,
+		Tokens: store.TokenMetrics{InputTokens: 100, OutputTokens: 50, TokensPerSecond: 20},
+	}, hint.LlamaServer)
+
+	var buf bytes.Buffer
+	require.NoError(t, m.WritePrometheus(&buf))
+	out := buf.String()
+	labels := `gen_ai_operation_name="chat",gen_ai_provider_name="llama.cpp",gen_ai_request_model="qwen"`
+	for _, want := range []string{
+		"# TYPE gen_ai_server_request_duration_seconds histogram",
+		"gen_ai_server_request_duration_seconds_bucket{" + labels + `,le="2.56"} 1`,
+		"gen_ai_server_request_duration_seconds_count{" + labels + "} 1",
+		"gen_ai_client_token_usage_bucket{" + labels + `,gen_ai_token_type="input",le="256"} 1`,
+		"gen_ai_server_time_per_output_token_seconds_sum{" + labels + "} 0.05",
+		`target_info{service_name="llama-swap"`,
+	} {
+		assert.Contains(t, out, want)
+	}
 }
 
 // TestGenAIMetrics_Record checks names, attributes and bucket placement of
